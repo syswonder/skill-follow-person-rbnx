@@ -1,0 +1,59 @@
+# Minimal robot model for the standalone Ranger follow deployment.  It declares
+# only what the follow stack needs — the chassis and the front camera — and
+# intentionally omits the mapping/nav2/speech/scene exports that belong to the
+# separate navigation deployment (robot-agilex-ranger_mini_v3).
+robot:
+  id: ranger_mini_v3_01
+  display_name: "AgileX Ranger Mini v3"
+  family: wheeled_robot
+  root_part: base
+  # AgileX Ranger Mini v3 published dimensions (verify on the actual chassis
+  # before allowing follow motion).
+  dimensions:
+    length_m: 0.738
+    width_m: 0.500
+    height_m: 0.338
+  footprint:
+    base_frame: base_link
+    points:
+      - [0.37, 0.25]
+      - [0.37, -0.25]
+      - [-0.37, -0.25]
+      - [-0.37, 0.25]
+  mass_kg: 63.0
+
+  exports:
+    - provider_id: front_camera
+      capabilities:
+        - {path: robonix/primitive/camera/rgb, description: "Front Orbbec RGB image stream for follow perception."}
+
+  components:
+    - id: base
+      type: mobile_base
+      urdf_link: base_link
+      exports:
+        - provider_id: ranger_chassis
+          capabilities:
+            - {path: robonix/primitive/chassis/driver, description: "AgileX Ranger Mini v3 chassis lifecycle driver."}
+            - {path: robonix/primitive/chassis/twist_in, description: "Canonical /cmd_vel velocity input (follow output goes here)."}
+            - {path: robonix/primitive/chassis/odom, description: "Ranger wheel/steer odometry and odom to base_link TF."}
+      components:
+        - id: front_camera
+          type: rgb_camera
+          urdf_link: camera_435i_link
+          exports:
+            - provider_id: front_camera
+              capabilities:
+                - {path: robonix/primitive/camera/rgb, description: "Front RGB image stream."}
+
+description:
+  summary: "AgileX Ranger Mini v3 configured solely for MiniCPM-RobotTrack person following."
+  can_do:
+    - "Stream front RGB-D imagery to the MiniCPM-RobotTrack inference server."
+    - "Follow a person under supervision by publishing guarded velocity to /cmd_vel."
+  cannot_do:
+    - "Map, localize or navigate — that is the separate navigation deployment's job."
+    - "Run at the same time as the navigation stack (both own the can_ranger bus)."
+  notes:
+    - "Dimensions and follow speed limits must be verified on the target chassis before live motion."
+    - "Defaults to dry-run: no velocity is published until a human sets mode: live."

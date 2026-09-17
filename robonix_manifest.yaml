@@ -1,0 +1,130 @@
+manifestVersion: 1
+name: robonix-ranger-follow-deploy
+
+catalog:
+  name: robonix.robot.agilex.ranger_mini_v3.follow
+  version: 0.1.0
+  description: >-
+    Standalone MiniCPM-RobotTrack person-following deployment for the AgileX
+    Ranger Mini v3.  Physically isolated from the navigation/SLAM deployment
+    (robot-agilex-ranger_mini_v3): a separate manifest, its own chassis + camera
+    primitives, and a dedicated follow primitive.  Only ever runs when the
+    navigation stack is stopped (single-service rule) so the two never contend
+    for the can_ranger bus or for /cmd_vel.
+  license: Apache-2.0
+  tags: [robot, deploy, agilex, ranger_mini_v3, wheeled, camera, minicpm, robottrack, following, ros2]
+  maintainers:
+    - wangxiaofeng
+
+env:
+  # Ranger navigation stack uses zenoh; keep the follow stack on the same RMW so
+  # the chassis primitive (built against the Ranger target) behaves identically.
+  RMW_IMPLEMENTATION: rmw_zenoh_cpp
+  ROBONIX_PROVIDER_BIND_HOST: 127.0.0.1
+  ROBONIX_ADVERTISE_HOST: 127.0.0.1
+  # Keep every model/runtime cache inside this ignored deployment checkout so
+  # the follow stack never falls back to a global home-directory cache.
+  XDG_CACHE_HOME: ${ROBONIX_DEPLOY_DIR}/.cache/xdg
+  MODELSCOPE_CACHE: ${ROBONIX_DEPLOY_DIR}/.cache/modelscope
+  HF_HOME: ${ROBONIX_DEPLOY_DIR}/.cache/huggingface
+  TORCH_HOME: ${ROBONIX_DEPLOY_DIR}/.cache/torch
+
+system:
+  atlas: {listen: 127.0.0.1:50051, log: info}
+  executor: {listen: 127.0.0.1:50061, log: info}
+  liaison: {listen: 127.0.0.1:50081, log: info}
+  soma:
+    listen: 127.0.0.1:50091
+    provider_id: soma
+    robot_yaml: ${ROBONIX_DEPLOY_DIR}/soma.yaml
+    log: info
+
+primitive:
+  # ------------------------------------------------------------------ chassis
+  # Identical upstream primitive to the one the navigation deployment uses, so
+  # the CAN wiring, odom and /cmd_vel contract match exactly.  This stack starts
+  # the chassis ITSELF; therefore it must never run while the navigation stack
+  # is up (both would launch ranger_bringup and fight for can_ranger).
+  - name: ranger_chassis
+    url: https://github.com/syswonder/primitive-agilex-ranger_mini_v3-chassis-rbnx
+    branch: main
+    config:
+      port_name: can_ranger
+      publish_odom_tf: true
+      # Chassis subscribes here; robottrack publishes here (see below).
+      cmd_vel_topic: /cmd_vel
+
+  # ------------------------------------------------------------------- camera
+  # Orbbec Gemini 336L, same model/params as the navigation deployment's
+  # front_camera so topic names and the RGB-D stream are identical.  camera_name
+  # camera_435i => /camera_435i/color/... and /camera_435i/depth/... topics.
+  - name: front_camera
+    url: https://github.com/syswonder/primitive-orbbec-camera
+    branch: main
+    config:
+      camera_name: camera_435i
+      camera_model: gemini330_series
+      color_profile: 640x480x30
+      depth_profile: 640x480x30
+      depth_registration: true
+      enable_color: true
+      enable_depth: true
+      enable_point_cloud: false
+      enable_imu: false
+      sentinel_timeout_s: 45.0
+
+  # ---------------------------------------------------------------- robottrack
+  # The MiniCPM-RobotTrack follow bridge.  The package itself is model-agnostic
+  # (depends: []; no Unitree SDK); every Ranger-specific value is overridden
+  # here in config rather than by editing the package's default yaml.
+  #
+  # KEY WIRING DIFFERENCE FROM GO2:  on Go2 the follow output went to
+  # /cmd_vel_nav (Go2 had a downstream velocity guard/smoother).  This stack has
+  # no Nav2, so robottrack publishes straight to /cmd_vel, which the Ranger
+  # chassis subscribes to.
+  #
+  # SAFETY:  mode defaults to dry-run — the node predicts and logs but PUBLISHES
+  # NOTHING to /cmd_vel until a human flips mode: live.  Bring the stack up in
+  # dry-run first, confirm camera + inference + prediction logs, then go live.
+  - name: go2_robottrack
+    path: ${ROBONIX_DEPLOY_DIR}/packages/go2_robottrack
+    config:
+      mode: dry-run
+      rgb_topic: /camera_435i/color/image_raw
+      depth_topic: /camera_435i/depth/image_raw
+      camera_info_topic: /camera_435i/color/camera_info
+      command_topic: /ranger/robottrack/cmd_vel_raw
+      server_url: http://127.0.0.1:5801/eval_dual
+      instruction: Follow the person ahead
+      model_input_mode: center_crop_height
+      model_crop_size: 384
+      jpeg_quality: 60
+      http_timeout_s: 30.0
+      waypoint_strategy: first
+      control_dt: 0.1
+      dispatch_hz: 50.0
+      max_plan_age_s: 1.5
+      # Ranger is faster and holonomic-ish (4WS) vs the Go2 forward-only gait,
+      # but keep the first bring-up conservative — raise only after live tuning.
+      max_vx: 0.15
+      max_wz: 0.30
+      # No Nav2 in this stack: publish directly to the chassis input.  The
+      # internal mux still selects between nav_raw and robottrack_raw; with no
+      # nav publisher present it simply forwards robottrack.
+      nav_raw_topic: /ranger/robottrack/nav_cmd_vel_raw
+      robottrack_raw_topic: /ranger/robottrack/cmd_vel_raw
+      selected_output_topic: /cmd_vel
+      selected_source: robottrack
+      source_max_age_s: 0.25
+      distance_enabled: false
+      target_distance_m: 5.0
+      min_target_distance_m: 0.5
+      max_target_distance_m: 7.0
+      distance_deadband_m: 0.25
+      distance_kp: 0.25
+      distance_max_forward_mps: 0.15
+      distance_max_reverse_mps: 0.0
+      distance_measurement_max_age_s: 0.60
+      distance_min_confidence: 0.50
+      distance_pair_max_delta_s: 0.20
+      distance_center_fallback: false
