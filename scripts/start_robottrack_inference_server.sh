@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # Start the pinned MiniCPM-RobotTrack HTTP inference server (:5801) that the
-# follow bridge calls.  Model tree is already present in the robonix container
-# at /root/MiniCPM-Robot — this script only pins and launches the server; it
-# performs no download.
+# follow bridge calls.  The model tree lives OUTSIDE the container under
+# <repo>/upstream/MiniCPM-Robot and is mounted in at runtime; this script only
+# pins and launches the server — it performs no download.
 
 set -euo pipefail
 
 readonly SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
-# Model tree (checkpoint + DINOv3 + SigLIP) lives inside the container.
-readonly UPSTREAM_ROOT="${ROBOTTRACK_UPSTREAM_ROOT:-/root/MiniCPM-Robot}"
+# Model tree (checkpoint + DINOv3 + SigLIP) lives OUTSIDE the container, mounted
+# under <repo>/upstream/MiniCPM-Robot (see .gitignore).  Resolve relative to the
+# repo root so the script works no matter where the repo is mounted.
+readonly UPSTREAM_ROOT="${ROBOTTRACK_UPSTREAM_ROOT:-${REPO_ROOT}/upstream/MiniCPM-Robot}"
 readonly TRACK_ROOT="${UPSTREAM_ROOT}/MiniCPM-RobotTrack"
 readonly SERVER_SCRIPT="${TRACK_ROOT}/realworld/sample/http_minicpm_robot_track_server.py"
 readonly MODEL_DIR="${ROBOTTRACK_MODEL_DIR:-${TRACK_ROOT}/minicpm_robot_track/checkpoints/MiniCPM-RobotTrack}"

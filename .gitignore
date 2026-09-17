@@ -16,3 +16,6 @@ rbnx-boot/
 **/__pycache__/
 *.pyc
 .vscode/settings.json
+# Model weights live outside git (mounted at runtime, ~7.1GB).
+upstream/
+models/

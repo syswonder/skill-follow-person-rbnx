@@ -26,12 +26,14 @@ build.sh / start.sh / stop.sh  # thin rbnx wrappers (run inside the container)
 packages/go2_robottrack/       # follow bridge (model-agnostic; copied from robot-unitree-go2)
 config/robottrack_assets.yaml  # MiniCPM model asset pins (no download)
 scripts/                       # inference server + follow launcher + asset verify
+upstream/MiniCPM-Robot/        # model weights (git-ignored, mounted at runtime, ~7.1GB)
 ```
 
 ## Run (inside the robonix container)
 
-The whole stack runs inside the `robonix_ros_dev` container. The model tree is
-already at `/root/MiniCPM-Robot`; nothing is downloaded.
+The whole stack runs inside the `robonix_ros_dev` container. The model tree
+lives OUTSIDE the container under `upstream/MiniCPM-Robot` (git-ignored) and is
+mounted in at runtime; nothing is downloaded.
 
 1. **Stop navigation first** (mandatory — both stacks own `can_ranger`).
 2. Mount this repo into the container, then:
