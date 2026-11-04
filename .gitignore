@@ -19,3 +19,9 @@ rbnx-boot/
 # Model weights live outside git (mounted at runtime, ~7.1GB).
 upstream/
 models/
+
+# Manifest backups from scripts/set_follow_mode.sh
+*.bak.*
+
+# Timestamped backups from local iterations
+*.bak-*

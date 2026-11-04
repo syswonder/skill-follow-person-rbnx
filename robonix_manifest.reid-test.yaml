@@ -1,0 +1,123 @@
+manifestVersion: 1
+name: robonix-ranger-reid-dryrun-test
+catalog:
+  name: robonix.robot.agilex.ranger_mini_v3.reid_test
+  version: 0.1.0
+  description: 'TEMPORARY test profile: front_camera + go2_robottrack only, so the specified-person lock
+    can be exercised while the Mid360 is unreachable. No lidar, no chassis, no Nav2, no mapping -> nothing
+    owns can_ranger and no process can publish /cmd_vel.'
+  license: Apache-2.0
+  tags:
+  - robot
+  - deploy
+  - agilex
+  - ranger_mini_v3
+  - minicpm
+  - robottrack
+  - following
+  - ros2
+  maintainers:
+  - wangxiaofeng
+env:
+  ROS_DOMAIN_ID: '0'
+  RMW_IMPLEMENTATION: rmw_zenoh_cpp
+  MAPPING_MAPS_DIR: ${HOME}/.robonix/maps
+  MAPPING_WEBUI_HOST: 0.0.0.0
+  HF_ENDPOINT: https://hf-mirror.com
+  PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+  SPEECH_BACKEND: tencent
+  ROBONIX_VELOCITY_OUTPUT_TOPIC: /cmd_vel_guarded
+  ROBONIX_TORCH_LIBRARY_PATH: /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/cuda-12.6/targets/aarch64-linux/lib
+system:
+  atlas:
+    listen: 0.0.0.0:50051
+  executor:
+    listen: 0.0.0.0:50061
+  pilot:
+    listen: 127.0.0.1:50071
+    vlm:
+      upstream: ${VLM_BASE_URL}
+      api_key: ${VLM_API_KEY}
+      model: ${VLM_MODEL}
+      api_format: openai
+  soma:
+    listen: 127.0.0.1:50091
+    robot_yaml: ${ROBONIX_DEPLOY_DIR}/soma.yaml
+  vitals:
+    listen: 0.0.0.0:50093
+  liaison:
+    listen: 0.0.0.0:50081
+primitive:
+- name: robot_description
+  url: https://github.com/syswonder/primitive-robot-description-rbnx
+  branch: main
+  manifest: package_manifest.native.yaml
+- name: front_camera
+  url: https://github.com/syswonder/primitive-orbbec-camera
+  branch: main
+  config:
+    camera_name: camera_435i
+    camera_model: gemini330_series
+    color_profile: 640x480x30
+    depth_profile: 640x480x30
+    depth_registration: true
+    enable_color: true
+    enable_depth: true
+    enable_point_cloud: false
+    enable_imu: false
+    sentinel_timeout_s: 45.0
+- name: go2_robottrack
+  path: ${ROBONIX_DEPLOY_DIR}/packages/go2_robottrack
+  config:
+    mode: dry-run
+    rgb_topic: /camera_435i/color/image_raw
+    depth_topic: /camera_435i/depth/image_raw
+    camera_info_topic: /camera_435i/color/camera_info
+    command_topic: /ranger/robottrack/cmd_vel_raw
+    server_url: http://127.0.0.1:5801/eval_dual
+    instruction: Follow the person ahead
+    model_input_mode: center_crop_height
+    model_crop_size: 384
+    jpeg_quality: 60
+    http_timeout_s: 30.0
+    waypoint_strategy: first
+    control_dt: 0.1
+    dispatch_hz: 50.0
+    max_plan_age_s: 1.5
+    max_vx: 0.5
+    max_wz: 0.3
+    nav_raw_topic: /ranger/robottrack/nav_cmd_vel_raw
+    robottrack_raw_topic: /ranger/robottrack/cmd_vel_raw
+    selected_output_topic: /cmd_vel_nav
+    selected_source: robottrack
+    source_max_age_s: 0.25
+    distance_enabled: true
+    target_distance_m: 1.0
+    min_target_distance_m: 0.5
+    max_target_distance_m: 7.0
+    distance_deadband_m: 0.1
+    distance_kp: 0.5
+    distance_max_forward_mps: 0.5
+    distance_max_reverse_mps: 0.0
+    distance_measurement_max_age_s: 0.6
+    distance_min_confidence: 0.5
+    distance_pair_max_delta_s: 0.2
+    distance_center_fallback: false
+    reid_enabled: true
+    reid_model_dir: ${ROBONIX_DEPLOY_DIR}/models/osnet
+    reid_match_threshold: 0.7
+    reid_enroll_samples: 5
+    reid_device: cuda:0
+    guard_input_topic: /cmd_vel_guarded
+    guard_output_topic: /cmd_vel
+    guard_forward_only: true
+    guard_max_vx_mps: 0.25
+    guard_max_wz_rps: 0.4
+    guard_max_linear_accel_mps2: 0.3
+    guard_max_angular_accel_rps2: 0.8
+    guard_command_timeout_s: 0.25
+    guard_publish_hz: 50.0
+    guard_min_turn_radius_m: 0.81
+    guard_turn_policy: clamp_yaw
+    guard_spin_vx_epsilon_mps: 0.02
+service: []

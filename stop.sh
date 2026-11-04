@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-# Stop the standalone Ranger follow stack.  Minimal: the follow stack carries no
-# UI dashboard or semantic-router leases (unlike robot-unitree-go2/stop.sh), so
-# shutdown is just `rbnx shutdown -f <manifest>`.
+# Stop the Ranger follow stack: `rbnx shutdown -f <manifest>`.
+#
+# This does NOT stop the two sidecars the follow stack depends on -- the
+# MiniCPM-RobotTrack inference server and the follow-distance intent router.
+# Use scripts/shutdown-follow.sh for a complete teardown that also releases
+# can_ranger and the host ports when `rbnx shutdown` leaves orphans behind.
 
 DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
 MANIFEST="${ROBONIX_MANIFEST:-$DEPLOY_DIR/robonix_manifest.yaml}"

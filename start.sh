@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Start the standalone Ranger follow stack (chassis + camera + robottrack) in
-# the robonix container.  Mirrors robot-agilex-ranger_mini_v3/start.sh, minus
-# the Piper arm and the nav2/mapping services this stack does not carry.
+# Start the Ranger follow stack in the robonix container.  Mirrors
+# robot-agilex-ranger_mini_v3/start.sh, minus the Piper arm, the wrist camera
+# and Scene, plus the RobotTrack primitive and its chassis guard.
+#
+# The stack carries the whole command chain it needs to be self-contained:
+# chassis + lidar + camera + mapping + Nav2 (velocity smoother and guard) +
+# robottrack, on top of the Robonix core services.
 #
 # SAFETY:  the follow stack owns the can_ranger bus and /cmd_vel.  It MUST NOT
 # run at the same time as the navigation stack.  Confirm the navigation stack
