@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 import math
 import threading
 import time
 from typing import Any, Mapping, Sequence
 from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 
 WAYPOINT_COUNT = 8
@@ -25,6 +28,38 @@ MAX_PLAN_AGE_S = 1.5
 DEFAULT_DISPATCH_HZ = 50.0
 MODEL_INPUT_MODE = "center_crop_height"
 MODEL_CROP_SIZE = 384
+
+# --------------------------------------------------------------------- guard
+# Ranger chassis adaptation.  Everything this guard re-implements used to live
+# inside go2_chassis, which the Ranger deployment does not have:
+#
+#   * the fail-closed motion gate (allow_motion/safety_ack/allowed_modes),
+#   * the 0.25 m/s and 0.40 rad/s chassis clamps,
+#   * the 0.25 s command timeout and the 0.50 s zero preamble,
+#   * a Go2 sport-mode service that translates and rotates simultaneously.
+#
+# RangerROSMessenger::TwistCmdCallback replaces all of that with behaviour the
+# upstream follow controller does not expect: it discards linear.x entirely and
+# pivots in place whenever |linear.x| / |angular.z| drops below its
+# min_turn_radius, and it switches the whole 4WS steering geometry the moment
+# linear.y is non-zero.  The guard restores the Go2 contract on top of that.
+# The full command chain this sits at the end of:
+#   robottrack -> source mux -> /cmd_vel_nav
+#              -> Nav2 velocity smoother -> /cmd_vel_guard_input
+#              -> Nav2 velocity guard   -> /cmd_vel_guarded
+#              -> THIS GUARD            -> /cmd_vel -> ranger_chassis
+# A deployment without the Nav2 service would feed this guard /cmd_vel_nav
+# directly; both are configurable via guard_input_topic.
+GUARD_INPUT_TOPIC = "/cmd_vel_guarded"
+GUARD_OUTPUT_TOPIC = "/cmd_vel"
+GUARD_TURN_POLICIES = ("clamp_yaw", "allow_spin", "block")
+# The vendored ranger_ros2 inside the Ranger chassis primitive reuses
+# RangerMiniV2Params for robot_model=ranger_mini_v3, whose min_turn_radius is
+# 0.4764 m.  The published Ranger Mini 3.0 manual states an 0.81 m Ackermann
+# turning radius.  The larger value is used here: clamping yaw for the stricter
+# radius guarantees a command can never land in the chassis's
+# `radius < min_turn_radius` branch, which silently zeroes linear.x.
+GUARD_MIN_TURN_RADIUS_M = 0.81
 
 
 class ProtocolError(ValueError):
@@ -123,9 +158,61 @@ class RuntimeConfig:
     distance_max_forward_mps: float = 0.15
     distance_max_reverse_mps: float = 0.0
     distance_measurement_max_age_s: float = 0.60
+    # With the specified-person lock deployed a measurement only exists because
+    # a frame showed the enrolled person, so its lifetime is capped at the frame
+    # itself rather than at the ordinary jitter tolerance: when the camera stops,
+    # the robot stops instead of coasting on the last thing it saw.
+    #
+    # The window must cover the WHOLE estimator, and the estimator is aged from
+    # the frame's arrival, not from the moment the result lands.  Measured on the
+    # Ranger's Orin: HOG 185 ms THEN OSNet 60 ms, i.e. 210 ms median and 419 ms
+    # worst end to end.  This default (0.25) was sized for OSNet alone and still
+    # is, which is why the deployment overrides it to 0.60 in the manifest --
+    # at 0.25 the dispatcher expires every measurement before it can use one.
+    # See docs/specified-person-follow.md, Step 17.
+    distance_identity_max_age_s: float = 0.25
     distance_min_confidence: float = 0.50
     distance_pair_max_delta_s: float = 0.20
     distance_center_fallback: bool = False
+    # Minimum detector confidence for a box to count as a person at all.  The
+    # HOG detector reports confidence as sigmoid(SVM margin), and its
+    # ``hitThreshold`` is 0.0, so every box it returns scores ABOVE 0.5 by
+    # construction -- the weakly-positive windows, which on background clutter
+    # are mostly furniture and wall edges, are exactly the ones this cuts.  They
+    # matter because the ReID gate scores every remaining box with OSNet and a
+    # single frame over ``reid_match_threshold`` is enough to produce a target,
+    # so one junk box that happens to resemble the template walks the robot off.
+    # 0.0 disables the filter and reproduces the pre-existing behaviour.
+    detector_min_confidence: float = 0.0
+    # Specified-person lock (ReID/OSNet).  Off by default: when false no OSNet
+    # model is loaded and the follow loop is exactly the pre-existing one.  When
+    # true the ROS node loads the model and the provider's ``follow_distance``
+    # capability additionally accepts the ``lock`` / ``unlock`` operations.
+    reid_enabled: bool = False
+    reid_model_dir: str = "/root/deploy/models/osnet"
+    # Same-camera, same-session comparison, so the measured margin is wide: on
+    # this rig a true match of the enrolled person scores 0.96-0.99.  The gate
+    # is per-frame with no temporal confirmation, so a threshold is the only
+    # thing standing between a background crop and a non-zero vx -- keep it well
+    # clear of the noise floor rather than just above it.
+    reid_match_threshold: float = 0.70
+    reid_enroll_samples: int = 5
+    reid_device: str = "cuda:0"
+    # Ranger chassis guard (see GUARD_* above).  Defaults reproduce the
+    # effective Go2 ceiling exactly: min(robottrack 0.50, smoother 0.30,
+    # chassis 0.25) == 0.25 m/s and min(0.40, 0.40) == 0.40 rad/s.
+    guard_input_topic: str = GUARD_INPUT_TOPIC
+    guard_output_topic: str = GUARD_OUTPUT_TOPIC
+    guard_forward_only: bool = True
+    guard_max_vx_mps: float = 0.25
+    guard_max_wz_rps: float = 0.40
+    guard_max_linear_accel_mps2: float = 0.30
+    guard_max_angular_accel_rps2: float = 0.80
+    guard_command_timeout_s: float = 0.25
+    guard_publish_hz: float = 50.0
+    guard_min_turn_radius_m: float = GUARD_MIN_TURN_RADIUS_M
+    guard_turn_policy: str = "clamp_yaw"
+    guard_spin_vx_epsilon_mps: float = 0.02
 
     @classmethod
     def from_mapping(cls, source: Mapping[str, Any] | None) -> "RuntimeConfig":
@@ -141,6 +228,15 @@ class RuntimeConfig:
         if mode not in {"dry-run", "live"}:
             raise ValueError("mode must be exactly 'dry-run' or 'live'")
 
+        guard_turn_policy = str(
+            cfg.get("guard_turn_policy") or cls.guard_turn_policy
+        ).strip().lower()
+        if guard_turn_policy not in GUARD_TURN_POLICIES:
+            raise ValueError(
+                "guard_turn_policy must be one of "
+                f"{', '.join(GUARD_TURN_POLICIES)}"
+            )
+
         server_url = str(cfg.get("server_url") or cls.server_url).strip()
         parsed = urlparse(server_url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -153,6 +249,13 @@ class RuntimeConfig:
         instruction = str(cfg.get("instruction") or cls.instruction).strip()
         if not instruction or len(instruction) > 1000:
             raise ValueError("instruction must contain 1..1000 characters")
+
+        reid_model_dir = str(cfg.get("reid_model_dir") or cls.reid_model_dir).strip()
+        if not reid_model_dir:
+            raise ValueError("reid_model_dir must be a non-empty path")
+        reid_device = str(cfg.get("reid_device") or cls.reid_device).strip()
+        if not reid_device:
+            raise ValueError("reid_device must be a non-empty torch device string")
 
         model_input_mode = str(
             cfg.get("model_input_mode") or MODEL_INPUT_MODE
@@ -168,6 +271,12 @@ class RuntimeConfig:
         jpeg_quality = int(cfg.get("jpeg_quality", cls.jpeg_quality))
         if not 1 <= jpeg_quality <= 100:
             raise ValueError("jpeg_quality must be in [1, 100]")
+
+        reid_enroll_samples = int(
+            cfg.get("reid_enroll_samples", cls.reid_enroll_samples)
+        )
+        if not 1 <= reid_enroll_samples <= 60:
+            raise ValueError("reid_enroll_samples must be in [1, 60]")
 
         strategy = str(cfg.get("waypoint_strategy") or WAYPOINT_STRATEGY).strip().lower()
         if strategy != WAYPOINT_STRATEGY:
@@ -198,6 +307,23 @@ class RuntimeConfig:
             "distance_enabled",
             cls.distance_enabled,
         )
+        reid_enabled = _explicit_bool(
+            cfg.get("reid_enabled"),
+            "reid_enabled",
+            cls.reid_enabled,
+        )
+        if reid_enabled and not distance_enabled:
+            # The lock is enforced inside the RGB-D estimator (it needs the
+            # per-frame person boxes the distance path already computes), so it
+            # cannot run without the distance path.  Switch it off and say so
+            # loudly instead of refusing to start: a typo in the new feature's
+            # configuration must never take the pre-existing follow loop down
+            # with it.
+            logger.warning(
+                "reid_enabled requires distance_enabled; the specified-person "
+                "lock is disabled and ordinary following continues"
+            )
+            reid_enabled = False
         min_target_distance_m = _bounded_float(
             cfg.get("min_target_distance_m"),
             "min_target_distance_m",
@@ -332,6 +458,13 @@ class RuntimeConfig:
                 minimum=0.05,
                 maximum=2.0,
             ),
+            distance_identity_max_age_s=_bounded_float(
+                cfg.get("distance_identity_max_age_s"),
+                "distance_identity_max_age_s",
+                cls.distance_identity_max_age_s,
+                minimum=0.05,
+                maximum=2.0,
+            ),
             distance_min_confidence=_bounded_float(
                 cfg.get("distance_min_confidence"),
                 "distance_min_confidence",
@@ -350,6 +483,102 @@ class RuntimeConfig:
                 cfg.get("distance_center_fallback"),
                 "distance_center_fallback",
                 cls.distance_center_fallback,
+            ),
+            detector_min_confidence=_bounded_float(
+                cfg.get("detector_min_confidence"),
+                "detector_min_confidence",
+                cls.detector_min_confidence,
+                minimum=0.0,
+                maximum=1.0,
+            ),
+            reid_enabled=reid_enabled,
+            reid_model_dir=reid_model_dir,
+            reid_match_threshold=_bounded_float(
+                cfg.get("reid_match_threshold"),
+                "reid_match_threshold",
+                cls.reid_match_threshold,
+                minimum=0.01,
+                maximum=1.0,
+            ),
+            reid_enroll_samples=reid_enroll_samples,
+            reid_device=reid_device,
+            guard_input_topic=_absolute_topic(
+                cfg.get("guard_input_topic"),
+                "guard_input_topic",
+                cls.guard_input_topic,
+            ),
+            guard_output_topic=_absolute_topic(
+                cfg.get("guard_output_topic"),
+                "guard_output_topic",
+                cls.guard_output_topic,
+            ),
+            guard_forward_only=_explicit_bool(
+                cfg.get("guard_forward_only"),
+                "guard_forward_only",
+                cls.guard_forward_only,
+            ),
+            guard_max_vx_mps=_bounded_float(
+                cfg.get("guard_max_vx_mps"),
+                "guard_max_vx_mps",
+                cls.guard_max_vx_mps,
+                minimum=0.0,
+                maximum=MAX_CONFIGURED_VX,
+                include_minimum=False,
+            ),
+            guard_max_wz_rps=_bounded_float(
+                cfg.get("guard_max_wz_rps"),
+                "guard_max_wz_rps",
+                cls.guard_max_wz_rps,
+                minimum=0.0,
+                maximum=MAX_CONFIGURED_WZ,
+                include_minimum=False,
+            ),
+            guard_max_linear_accel_mps2=_bounded_float(
+                cfg.get("guard_max_linear_accel_mps2"),
+                "guard_max_linear_accel_mps2",
+                cls.guard_max_linear_accel_mps2,
+                minimum=0.0,
+                maximum=10.0,
+                include_minimum=False,
+            ),
+            guard_max_angular_accel_rps2=_bounded_float(
+                cfg.get("guard_max_angular_accel_rps2"),
+                "guard_max_angular_accel_rps2",
+                cls.guard_max_angular_accel_rps2,
+                minimum=0.0,
+                maximum=20.0,
+                include_minimum=False,
+            ),
+            guard_command_timeout_s=_bounded_float(
+                cfg.get("guard_command_timeout_s"),
+                "guard_command_timeout_s",
+                cls.guard_command_timeout_s,
+                minimum=0.0,
+                maximum=5.0,
+                include_minimum=False,
+            ),
+            guard_publish_hz=_bounded_float(
+                cfg.get("guard_publish_hz"),
+                "guard_publish_hz",
+                cls.guard_publish_hz,
+                minimum=1.0,
+                maximum=200.0,
+            ),
+            guard_min_turn_radius_m=_bounded_float(
+                cfg.get("guard_min_turn_radius_m"),
+                "guard_min_turn_radius_m",
+                cls.guard_min_turn_radius_m,
+                minimum=0.0,
+                maximum=10.0,
+                include_minimum=False,
+            ),
+            guard_turn_policy=guard_turn_policy,
+            guard_spin_vx_epsilon_mps=_bounded_float(
+                cfg.get("guard_spin_vx_epsilon_mps"),
+                "guard_spin_vx_epsilon_mps",
+                cls.guard_spin_vx_epsilon_mps,
+                minimum=0.0,
+                maximum=1.0,
             ),
         )
 

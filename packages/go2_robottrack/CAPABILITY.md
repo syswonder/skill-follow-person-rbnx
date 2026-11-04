@@ -19,6 +19,22 @@ single-person association, at most three frames of HOG-seeded optical-flow
 continuation, and D435i aligned depth to replace only longitudinal speed while
 preserving RobotTrack yaw. Optical flow never acquires a target by itself.
 
+The same capability also accepts the two specified-person operations `lock` and
+`unlock`, which select *which* person is followed rather than how far behind to
+stay. `lock` enrolls the person currently nearest the camera as the one person
+to follow, using an OSNet person re-identification embedding; from then on every
+detection whose appearance similarity falls below the configured threshold is
+discarded before any association runs, so the follow loop cannot switch to a
+different person even when that person is closer to the previous box or scores
+higher on the detector. When the enrolled person is not visible the capability
+reports no target and the robot holds `vx = 0` instead of following whoever is
+in frame; it never falls back to the image-centre pseudo-target while locked.
+`unlock` forgets the enrolled person and restores ordinary following. Both
+operations are available only in deployments that enable the lock and whose
+OSNet model loaded successfully; otherwise they return `accepted=false` with an
+explanatory `detail`. Enrolment needs a few consecutive frames, so `lock`
+returns with status `enrolling` and becomes `locked` shortly afterwards.
+
 The provider does not load or modify the MiniCPM model. It sends the freshest
 encoded D435i RGB frame and instruction to the separately running official
 `/eval_dual` inference server, accepts finite velocity-only output or a finite

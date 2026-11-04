@@ -11,12 +11,18 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass
+import logging
 import math
 import time
-from typing import Protocol, Sequence
+from typing import TYPE_CHECKING, Protocol, Sequence
 
 import cv2
 import numpy as np
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids importing torch
+    from .person_reid import PersonReID, ReidLockState
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -509,6 +515,21 @@ class RgbdDistanceConfig:
     jump_confirmation_frames: int = 2
     jump_consistency_m: float = 0.30
     smoothing_window: int = 3
+    # Boxes weaker than this never become candidates, for enrolment or for
+    # matching.  HOG's ``hitThreshold`` is 0.0, so it returns every
+    # weakly-positive window and its confidences are all above 0.5 by
+    # construction -- on background clutter those weak boxes are furniture and
+    # wall edges.  Raising this is the cheap half of "use a better detector":
+    # the ReID gate turns any single box that resembles the template into a
+    # target, so junk boxes are the raw material for walking off after nobody.
+    # 0.0 keeps every detection, i.e. the pre-existing behaviour.
+    detector_min_confidence: float = 0.0
+    # Specified-person lock (ReID).  Disabled by default; the feature costs one
+    # OSNet forward pass per frame and only ever runs while a lock is engaged.
+    reid_enabled: bool = False
+    reid_match_threshold: float = 0.70
+    reid_enroll_samples: int = 5
+    reid_min_bbox_height_px: int = 64
 
     def __post_init__(self) -> None:
         finite_positive = {
@@ -532,6 +553,7 @@ class RgbdDistanceConfig:
             "center_fallback_width_fraction": self.center_fallback_width_fraction,
             "center_fallback_height_fraction": self.center_fallback_height_fraction,
             "center_fallback_confidence": self.center_fallback_confidence,
+            "detector_min_confidence": self.detector_min_confidence,
         }
         for name, value in unit_intervals.items():
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
@@ -556,6 +578,12 @@ class RgbdDistanceConfig:
         }.items():
             if int(value) != value or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
+        if not 0.0 < self.reid_match_threshold <= 1.0:
+            raise ValueError("reid_match_threshold must be in (0, 1]")
+        if int(self.reid_enroll_samples) != self.reid_enroll_samples or self.reid_enroll_samples < 1:
+            raise ValueError("reid_enroll_samples must be a positive integer")
+        if int(self.reid_min_bbox_height_px) != self.reid_min_bbox_height_px or self.reid_min_bbox_height_px < 1:
+            raise ValueError("reid_min_bbox_height_px must be a positive integer")
 
 
 @dataclass(frozen=True)
@@ -606,9 +634,17 @@ class RgbdPersonDistanceEstimator:
         self,
         detector: PersonDetector | None = None,
         config: RgbdDistanceConfig | None = None,
+        *,
+        reid: "PersonReID | None" = None,
+        reid_state: "ReidLockState | None" = None,
     ) -> None:
         self._config = config or RgbdDistanceConfig()
         self._detector = detector or OpenCvHogPersonDetector()
+        # Specified-person lock.  ``reid`` is the OSNet model; ``reid_state`` is
+        # the shared lock written by the Robonix provider thread.  Both are
+        # optional: without them the estimator behaves exactly as before.
+        self._reid = reid
+        self._reid_state = reid_state
         self._tracker = ShortTermOpticalFlowBoxTracker(
             ShortTermTrackingConfig(max_frames=self._config.tracking_max_frames)
         )
@@ -616,6 +652,9 @@ class RgbdPersonDistanceEstimator:
         self._pending_detection_bbox: BoundingBox | None = None
         self._pending_detection_count = 0
         self._missed_detections = 0
+        # The person being enrolled: fixed on the first person seen after the
+        # command so every later sample comes from that same person.
+        self._enroll_anchor_bbox: BoundingBox | None = None
         self._last_frame_timestamp_s: float | None = None
         self._last_accepted_raw_m: float | None = None
         self._distance_history: deque[float] = deque(
@@ -628,6 +667,7 @@ class RgbdPersonDistanceEstimator:
         self._previous_bbox = None
         self._pending_detection_bbox = None
         self._pending_detection_count = 0
+        self._enroll_anchor_bbox = None
         self._tracker.reset()
         self._missed_detections = 0
         self._last_frame_timestamp_s = None
@@ -676,11 +716,21 @@ class RgbdPersonDistanceEstimator:
         image_width: int,
         image_height: int,
     ) -> tuple[BoundingBox | None, float, str]:
+        # The single funnel every candidate passes through, for enrolment and
+        # for matching alike.  The confidence floor lives here rather than in
+        # the detector so a swap to a better model cannot silently reintroduce
+        # the weak boxes it was added to remove.  Note what is deliberately NOT
+        # here: a minimum box height.  ``reid_min_bbox_height_px`` is checked in
+        # ``_enroll_sample_index`` only, so matching still scores arbitrarily
+        # small crops (see docs/specified-person-follow.md, Step 18).
+        min_confidence = float(self._config.detector_min_confidence)
         usable: list[PersonDetection] = []
         for detection in detections:
             confidence = float(detection.confidence)
             bbox = detection.bbox.clipped(image_width, image_height)
             if bbox is None or not math.isfinite(confidence):
+                continue
+            if confidence < min_confidence:
                 continue
             usable.append(
                 PersonDetection(bbox, max(0.0, min(1.0, confidence)))
@@ -689,28 +739,147 @@ class RgbdPersonDistanceEstimator:
         selected: PersonDetection | None = None
         source = "none"
 
+        # ------------------------------------------------------------------
+        # Specified-person lock (ReID gate).
+        #
+        # With the lock deployed, an identity is required for every frame: a
+        # verified match of the enrolled person is the ONLY thing that can
+        # become the target, and the ordinary association/selection logic below
+        # never runs.  So a non-matching person can never take over -- not by
+        # standing where the target stood, not by having a higher HOG
+        # confidence -- and neither can a false positive on furniture, nor a
+        # frame that arrives before anyone has said "follow me" (there is no
+        # "me" to follow yet).  Among the detections that do resemble the
+        # enrolled person, the best match wins; the previous box only breaks
+        # near-ties.
+        #
+        # When nothing matches, no target is produced and the caller reports
+        # "reid-*" -- which the distance controller turns into vx = 0.  Stopping
+        # is the intended behaviour; the robot must not resume following whoever
+        # happens to be in frame.
+        # ------------------------------------------------------------------
+        lock = self._reid_state
+        # Detections that look like the enrolled person, and the one chosen
+        # among them; the choice itself is made below, next to the association
+        # helpers it shares.
+        locked_matches: list[tuple[PersonDetection, float]] = []
+        locked_target: PersonDetection | None = None
+        # True when an enrolment is pending but this frame yielded nothing to
+        # enrol -- nobody in frame, nobody tall enough for OSNet's crop, or
+        # somebody who is not the person being enrolled.
+        enroll_stalled = False
+        enroll_reason: str | None = None
+        if lock is not None and self._reid is not None and usable:
+            if lock.needs_features():
+                features = self._reid.extract(bgr, [item.bbox for item in usable])
+                if lock.pending_enroll() > 0:
+                    enroll_index = self._enroll_sample_index(
+                        usable, image_width, image_height
+                    )
+                    if enroll_index is None:
+                        enroll_stalled = True
+                        enroll_reason = "the person being enrolled is not in view"
+                    elif not lock.add_enroll_feature(features[enroll_index]):
+                        enroll_stalled = True
+                        enroll_reason = (
+                            "the person in view is not the one being enrolled"
+                        )
+                if lock.is_active():
+                    similarities, _best = lock.match_features(features)
+                    threshold = lock.threshold
+                    locked_matches = [
+                        (item, score)
+                        for item, score in zip(usable, similarities)
+                        if score is not None and score >= threshold
+                    ]
+        elif lock is not None and lock.pending_enroll() > 0:
+            enroll_stalled = True
+            enroll_reason = "the person being enrolled is not in view"
+
+        if lock is not None and lock.pending_enroll() <= 0:
+            # Enrolment is over (locked, failed or cleared): the anchor has done
+            # its job and must not steer a later enrolment.
+            self._enroll_anchor_bbox = None
+
+        if enroll_stalled:
+            # The lock waits for a person instead of hanging silently in
+            # ``enrolling``: it re-announces the wait at a fixed interval until
+            # the person being enrolled steps in front of the camera.
+            prompt = lock.note_enroll_wait(reason=enroll_reason)
+            if prompt is not None:
+                logger.warning("specified-person lock: %s", prompt)
+
+        def locked_rank(match: tuple[PersonDetection, float]) -> tuple[float, float]:
+            """Order the locked candidates: identity first, continuity second.
+
+            The person who looks most like the enrolled template is the target.
+            Association with the previous box only breaks near-ties -- it must
+            never hand the target to a stranger who happens to stand where the
+            target stood.
+            """
+
+            item, similarity = match
+            continuity = 0.0
+            if self._previous_bbox is not None:
+                rank = self._association_rank(
+                    self._previous_bbox, item.bbox, image_width, image_height
+                )
+                continuity = float("-inf") if rank is None else rank
+            return (similarity, continuity)
+
+        if locked_matches:
+            locked_target = max(locked_matches, key=locked_rank)[0]
+
+        # Why this frame produced no target, for the log and the capability
+        # response.  The lock state is re-read here because enrolment may have
+        # completed on this very frame.  Pure data: no branch consumes it.
+        if lock is None:
+            # The lock was asked for but no model is behind it (OSNet failed to
+            # load).  No identity can ever be verified, so nothing may move.
+            reid_reason = "reid-unavailable"
+        elif lock.is_active():
+            # Locked, but nobody in this frame is the enrolled person -- a
+            # stranger, nobody at all, or nobody OSNet could score.
+            reid_reason = "reid-no-match"
+        elif lock.is_engaged():
+            # "Follow me" has been said but nobody has been verified yet:
+            # enrolment is still collecting samples, it is waiting for a person
+            # to appear, or it gave up on an unusable crop.  Without this the
+            # window between the command and the verified identity -- which
+            # never expires -- was completely ungated, and the robot followed
+            # whatever the detector mistook for a person while the operator was
+            # still walking into frame.
+            reid_reason = "reid-unverified"
+        else:
+            # The lock is deployed and available, but nobody has asked for
+            # specified follow.  There is no "me" in this deployment, so the
+            # pre-existing "follow whoever is in frame" loop must not run.
+            reid_reason = "reid-inactive"
+
         def associated_with(
             reference: BoundingBox,
         ) -> list[tuple[float, PersonDetection]]:
-            diagonal = math.hypot(image_width, image_height)
             associated: list[tuple[float, PersonDetection]] = []
             for candidate in usable:
-                overlap = bbox_iou(reference, candidate.bbox)
-                old_center = reference.center
-                new_center = candidate.bbox.center
-                center_fraction = math.hypot(
-                    new_center[0] - old_center[0],
-                    new_center[1] - old_center[1],
-                ) / diagonal
-                if (
-                    overlap >= self._config.association_min_iou
-                    or center_fraction <= self._config.association_max_center_fraction
-                ):
-                    rank = 2.0 * overlap - center_fraction + 0.25 * candidate.confidence
-                    associated.append((rank, candidate))
+                rank = self._association_rank(
+                    reference, candidate.bbox, image_width, image_height
+                )
+                if rank is None:
+                    continue
+                associated.append(
+                    (rank + 0.25 * candidate.confidence, candidate)
+                )
             return associated
 
-        if usable and self._previous_bbox is None:
+        if self._config.reid_enabled:
+            # Identity is required, so the lock's answer is the whole answer:
+            # a verified match of the enrolled person, or nothing.
+            if locked_target is not None:
+                selected = locked_target
+                source = "reid"
+            else:
+                selected = None
+        elif usable and self._previous_bbox is None:
             candidate = max(usable, key=lambda item: item.confidence)
             if self._config.detection_confirmation_frames == 1:
                 selected = candidate
@@ -751,6 +920,19 @@ class RgbdPersonDistanceEstimator:
                 self._tracker.start(bgr, selected.bbox, selected.confidence)
             return selected.bbox, selected.confidence, source
 
+        if self._config.reid_enabled:
+            # The person is not in this frame, so no target exists.  This
+            # returns *before* the optical-flow bridge on purpose: the bridge
+            # follows a box, not a person, so it would carry the target onto
+            # whoever stepped into that spot.  Never fall back to the
+            # image-centre pseudo-target either -- a centred stranger is exactly
+            # the failure this feature exists to prevent.
+            self._missed_detections += 1
+            self._tracker.reset()
+            if self._missed_detections >= self._config.association_memory_frames:
+                self._previous_bbox = None
+            return None, 0.0, reid_reason
+
         if self._config.enable_short_term_tracking:
             tracked = self._tracker.update(bgr)
             if tracked is not None:
@@ -774,6 +956,80 @@ class RgbdPersonDistanceEstimator:
             height,
         )
         return bbox, self._config.center_fallback_confidence, "center-fallback"
+
+    def _association_rank(
+        self,
+        reference: BoundingBox,
+        bbox: BoundingBox,
+        image_width: int,
+        image_height: int,
+    ) -> float | None:
+        """How well ``bbox`` continues the box ``reference``, or ``None``.
+
+        Overlap dominates, centre motion is a penalty; a candidate that neither
+        overlaps nor stays near the reference is not an association at all.
+        """
+
+        overlap = bbox_iou(reference, bbox)
+        old_center = reference.center
+        new_center = bbox.center
+        center_fraction = math.hypot(
+            new_center[0] - old_center[0],
+            new_center[1] - old_center[1],
+        ) / math.hypot(image_width, image_height)
+        if (
+            overlap < self._config.association_min_iou
+            and center_fraction > self._config.association_max_center_fraction
+        ):
+            return None
+        return 2.0 * overlap - center_fraction
+
+    def _enroll_sample_index(
+        self,
+        usable: Sequence[PersonDetection],
+        image_width: int,
+        image_height: int,
+    ) -> int | None:
+        """Pick which detection to enroll as the person to follow.
+
+        The target is *the first person seen* after the command: the anchor is
+        fixed on the first frame that shows somebody (the largest box -- the
+        person standing nearest is the one addressing the robot), and every
+        later sample must be that same person, i.e. a box associated with the
+        anchor.  A frame that only shows somebody else is skipped so the
+        template is never an average of two people.
+
+        Boxes too short for OSNet's 256x128 input are ignored.  Returns the
+        index into ``usable`` or ``None`` when this frame yields no sample.
+        """
+
+        tall = [
+            (index, item)
+            for index, item in enumerate(usable)
+            if item.bbox.height >= self._config.reid_min_bbox_height_px
+        ]
+        if not tall:
+            return None
+        anchor = self._enroll_anchor_bbox
+        if anchor is None:
+            index, item = max(tall, key=lambda pair: pair[1].bbox.area)
+            self._enroll_anchor_bbox = item.bbox
+            return index
+        best_index: int | None = None
+        best_rank: float | None = None
+        for index, item in tall:
+            rank = self._association_rank(anchor, item.bbox, image_width, image_height)
+            if rank is None:
+                continue
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
+                best_index = index
+        if best_index is None:
+            # The person being enrolled has left the picture: keep the anchor
+            # and wait for them rather than enrolling whoever is here now.
+            return None
+        self._enroll_anchor_bbox = usable[best_index].bbox
+        return best_index
 
     def _depth_roi(self, bbox: BoundingBox) -> BoundingBox:
         inset_x = int(round(bbox.width * self._config.depth_horizontal_inset))
