@@ -16,7 +16,7 @@ catalog:
   license: Apache-2.0
   tags: [robot, deploy, agilex, ranger_mini_v3, minicpm, robottrack, following, ros2]
   maintainers:
-    - wangxiaofeng
+    - wangxiaofeng <wxf0705186@users.noreply.github.com>
 
 # ---------------------------------------------------------------------------
 # The reference profile deliberately does NOT start Scene (it was the source of
