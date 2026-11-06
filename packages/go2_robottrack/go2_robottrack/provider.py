@@ -229,6 +229,15 @@ def _stop_runtime() -> tuple[bool, str]:
         stop_event = _runtime_stop
         _active = False
     distance_runtime.set_active(False)
+    # The OSNet model lives inside the ROS runtime that is going away.  Drop the
+    # lock entirely rather than keeping a stale template: the enrolled
+    # appearance was captured from a camera pose and lighting that no longer
+    # apply, and silently resuming it after a restart is the kind of surprise
+    # this feature exists to prevent.  The operator says "跟着我" again.
+    from .person_reid import reid_lock_state
+
+    reid_lock_state.clear()
+    reid_lock_state.configure(available=False)
     if stop_event is not None:
         stop_event.set()
     if thread is not None:
@@ -260,7 +269,19 @@ def shutdown():
 def follow_distance(
     request: FollowDistance_Request,
 ) -> FollowDistance_Response:
-    """Set, adjust, or read the optional metric follow-distance target."""
+    """Set, adjust, or read the optional metric follow-distance target.
+
+    Also carries the specified-person lock: the ``lock`` operation enrolls
+    whoever is currently in front as *the* person to follow, and ``unlock``
+    forgets them.  Both reuse this contract's ``string operation`` field, so no
+    new contract, IDL, or codegen is involved.  ``lock``/``unlock`` are accepted
+    only while the deployment enabled the lock, and a ``lock`` request returns
+    ``accepted=False`` with an explanatory ``detail`` when it is unavailable.
+    """
+
+    operation = str(request.operation or "").strip().casefold()
+    if operation in {"lock", "unlock"}:
+        return _reid_lock_response(operation)
 
     result = distance_runtime.handle(request.operation, request.meters)
     snapshot = result.snapshot
@@ -274,6 +295,55 @@ def follow_distance(
         measured_distance_m=0.0 if measured is None else measured,
         status=snapshot.status,
         detail=result.detail,
+    )
+
+
+def _reid_lock_response(operation: str) -> FollowDistance_Response:
+    """Handle the specified-person ``lock`` / ``unlock`` operations."""
+
+    from .person_reid import reid_lock_state
+
+    distance_snapshot = distance_runtime.snapshot()
+    lock_available = _config.get("reid_enabled", False) and reid_lock_state.available
+    if not lock_available:
+        if not _config.get("reid_enabled", False):
+            detail = "specified-person lock is not enabled in this deployment"
+        else:
+            detail = (
+                "specified-person lock is enabled but the OSNet model is not "
+                "loaded; check the RobotTrack runtime log"
+            )
+        return FollowDistance_Response(
+            accepted=False,
+            enabled=distance_snapshot.enabled,
+            active=distance_snapshot.active,
+            has_measurement=distance_snapshot.measured_distance_m is not None,
+            target_distance_m=distance_snapshot.target_distance_m,
+            measured_distance_m=0.0
+            if distance_snapshot.measured_distance_m is None
+            else distance_snapshot.measured_distance_m,
+            status="reid_unavailable",
+            detail=detail,
+        )
+
+    lock = (
+        reid_lock_state.request_enroll()
+        if operation == "lock"
+        else reid_lock_state.clear()
+    )
+    return FollowDistance_Response(
+        accepted=True,
+        enabled=distance_snapshot.enabled,
+        # ``active`` here reports the lock, which is what the caller asked
+        # about; the distance controller's own activation is unaffected.
+        active=lock.active,
+        has_measurement=lock.enrolled,
+        target_distance_m=distance_snapshot.target_distance_m,
+        measured_distance_m=0.0
+        if distance_snapshot.measured_distance_m is None
+        else distance_snapshot.measured_distance_m,
+        status=lock.status,
+        detail=lock.detail,
     )
 
 

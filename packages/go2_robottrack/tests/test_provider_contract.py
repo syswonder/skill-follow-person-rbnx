@@ -308,6 +308,82 @@ class ProviderContractTests(unittest.TestCase):
         self.assertEqual(response.target_distance_m, 5.0)
         self.assertIn("[0.50, 7.00]", response.detail)
 
+    def _distance_request(self, operation: str, meters: float = 0.0):
+        request_type = sys.modules[
+            "go2_robottrack_control_mcp"
+        ].FollowDistance_Request
+        return request_type(operation=operation, meters=meters)
+
+    def test_lock_is_refused_when_the_deployment_disabled_it(self) -> None:
+        module = load_provider_module()
+        self.assertEqual(
+            module.initialize({"distance_enabled": True}).kind, "ok"
+        )
+        response = module.follow_distance(self._distance_request("lock"))
+        self.assertFalse(response.accepted)
+        self.assertEqual(response.status, "reid_unavailable")
+        self.assertIn("not enabled", response.detail)
+
+    def test_lock_is_refused_while_the_model_is_not_loaded(self) -> None:
+        """Enabled but no OSNet behind it must not be acknowledged."""
+
+        module = load_provider_module()
+        self.assertEqual(
+            module.initialize(
+                {"distance_enabled": True, "reid_enabled": True}
+            ).kind,
+            "ok",
+        )
+        from go2_robottrack.person_reid import reid_lock_state
+
+        reid_lock_state.clear()
+        reid_lock_state.configure(available=False)
+        response = module.follow_distance(self._distance_request("lock"))
+        self.assertFalse(response.accepted)
+        self.assertEqual(response.status, "reid_unavailable")
+        self.assertIn("not loaded", response.detail)
+
+    def test_lock_and_unlock_drive_the_shared_lock_state(self) -> None:
+        module = load_provider_module()
+        self.assertEqual(
+            module.initialize(
+                {"distance_enabled": True, "reid_enabled": True}
+            ).kind,
+            "ok",
+        )
+        from go2_robottrack.person_reid import reid_lock_state
+
+        reid_lock_state.clear()
+        reid_lock_state.configure(available=True)
+
+        locked = module.follow_distance(self._distance_request("lock"))
+        self.assertTrue(locked.accepted)
+        self.assertEqual(locked.status, "enrolling")
+        self.assertEqual(reid_lock_state.snapshot().status, "enrolling")
+
+        unlocked = module.follow_distance(self._distance_request("unlock"))
+        self.assertTrue(unlocked.accepted)
+        self.assertEqual(unlocked.status, "unlocked")
+        self.assertFalse(reid_lock_state.snapshot().active)
+
+    def test_distance_operations_are_unaffected_by_the_lock_branch(self) -> None:
+        module = load_provider_module()
+        self.assertEqual(
+            module.initialize(
+                {"distance_enabled": True, "reid_enabled": True}
+            ).kind,
+            "ok",
+        )
+        from go2_robottrack.person_reid import reid_lock_state
+
+        reid_lock_state.clear()
+        response = module.follow_distance(
+            self._distance_request("set", 6.0)
+        )
+        # "set" must still reach the distance runtime, not the lock branch.
+        self.assertTrue(response.accepted)
+        self.assertEqual(response.status, "target_updated")
+
 
 if __name__ == "__main__":
     unittest.main()

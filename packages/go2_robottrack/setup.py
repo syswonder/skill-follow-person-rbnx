@@ -29,6 +29,7 @@ setup(
         "console_scripts": [
             "robottrack_node = go2_robottrack.ros_node:main",
             "robottrack_camera_preview = go2_robottrack.camera_preview_node:main",
+            "robottrack_chassis_guard = go2_robottrack.chassis_guard_node:main",
         ],
     },
 )

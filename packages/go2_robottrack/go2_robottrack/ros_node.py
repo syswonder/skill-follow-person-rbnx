@@ -18,6 +18,7 @@ from rclpy.qos import qos_profile_sensor_data
 from sensor_msgs.msg import Image
 
 from .camera_preview import CameraFrameUploadWorker
+from .chassis_guard_node import RangerChassisGuardNode
 from .core import (
     LatestFrameMailbox,
     PlanStore,
@@ -165,11 +166,55 @@ class RobotTrackNode(Node):
                 max_source_delta_s=self._config.distance_pair_max_delta_s,
                 max_frame_age_s=self._config.distance_measurement_max_age_s,
             )
+            # Specified-person lock: load OSNet once here (not per frame) and
+            # hand the estimator both the model and the provider-shared lock
+            # state.  A load failure is logged and degrades to the plain
+            # follow loop rather than taking the whole runtime down.
+            reid_model = None
+            reid_state = None
+            if self._config.reid_enabled:
+                try:
+                    from .person_reid import PersonReID, reid_lock_state
+
+                    reid_model = PersonReID(
+                        self._config.reid_model_dir,
+                        device=self._config.reid_device,
+                    )
+                    reid_lock_state.configure(
+                        threshold=self._config.reid_match_threshold,
+                        enroll_samples=self._config.reid_enroll_samples,
+                        available=True,
+                    )
+                    reid_state = reid_lock_state
+                    self.get_logger().info(
+                        "specified-person lock ready "
+                        f"(threshold {self._config.reid_match_threshold:.2f}, "
+                        f"{self._config.reid_enroll_samples} enroll samples)"
+                    )
+                except Exception as error:  # noqa: BLE001 - degrade, never abort
+                    # The node itself keeps running, but with the lock deployed
+                    # and no model behind it no identity can ever be verified --
+                    # and forward motion is gated on exactly that, so the robot
+                    # will not translate until OSNet loads.  Say so instead of
+                    # leaving a silently stationary robot.
+                    self.get_logger().error(
+                        f"specified-person lock unavailable: {error}; "
+                        "reid_enabled is true, so no identity can be verified "
+                        "and the follow loop will not command forward motion"
+                    )
+                    reid_model = None
+                    reid_state = None
             self._distance_estimator = RgbdPersonDistanceEstimator(
                 config=RgbdDistanceConfig(
                     max_frame_age_s=self._config.distance_measurement_max_age_s,
                     enable_center_fallback=self._config.distance_center_fallback,
-                )
+                    detector_min_confidence=self._config.detector_min_confidence,
+                    reid_enabled=self._config.reid_enabled,
+                    reid_match_threshold=self._config.reid_match_threshold,
+                    reid_enroll_samples=self._config.reid_enroll_samples,
+                ),
+                reid=reid_model,
+                reid_state=reid_state,
             )
             self._distance_worker = RgbdDistanceWorker(
                 self._distance_estimator,
@@ -437,17 +482,31 @@ class RobotTrackNode(Node):
     def _expire_distance_measurement(self, now: float) -> None:
         with self._distance_state_lock:
             received = self._distance_measurement_received_monotonic
-            if (
-                received is None
-                or now - received
-                <= self._config.distance_measurement_max_age_s
-            ):
+            if received is None:
+                return
+            # With the specified-person lock deployed, a measurement only exists
+            # because some frame showed the enrolled person -- so it may not
+            # outlive the frames that produced it by more than the inference
+            # latency and normal jitter.  Without this cap the last verified
+            # measurement survives the ordinary 0.60 s tolerance, and a camera
+            # that stops delivering (or an estimator that stops producing)
+            # leaves the robot driving forward on the last thing it saw, with
+            # nobody in frame.
+            limit = (
+                self._config.distance_identity_max_age_s
+                if self._config.reid_enabled
+                else self._config.distance_measurement_max_age_s
+            )
+            if now - received <= limit:
                 return
             distance_runtime.update_measurement(
                 None,
                 status="stale_measurement",
                 source="",
-                detail="the latest RGB-D target distance measurement expired",
+                detail=(
+                    "the latest RGB-D target distance measurement expired "
+                    f"({limit:.2f}s)"
+                ),
             )
             self._distance_measurement_received_monotonic = None
 
@@ -623,6 +682,7 @@ def run_ros_runtime(
 
     context = Context()
     node: RobotTrackNode | None = None
+    guard: RangerChassisGuardNode | None = None
     executor: SingleThreadedExecutor | None = None
     try:
         rclpy.init(args=[], context=context)
@@ -631,8 +691,18 @@ def run_ros_runtime(
             context=context,
             manage_distance_runtime=False,
         )
+        # Dry-run still publishes nothing at all, so the guard would only add a
+        # 50 Hz stream of zeros on /cmd_vel.  Start it exactly when the
+        # Robottrack side is allowed to command motion.
+        if RuntimeConfig.from_mapping(config).mode == "live":
+            guard = RangerChassisGuardNode(
+                config_overrides=config,
+                context=context,
+            )
         executor = SingleThreadedExecutor(context=context)
         executor.add_node(node)
+        if guard is not None:
+            executor.add_node(guard)
         ready_event.set()
         while context.ok() and not stop_event.is_set():
             executor.spin_once(timeout_sec=0.1)
@@ -640,13 +710,15 @@ def run_ros_runtime(
         errors.append(f"{type(error).__name__}: {error}")
         ready_event.set()
     finally:
-        if executor is not None and node is not None:
-            try:
-                executor.remove_node(node)
-            except Exception:
-                pass
-        if node is not None:
-            node.destroy_node()
+        nodes = [entry for entry in (node, guard) if entry is not None]
+        if executor is not None:
+            for entry in nodes:
+                try:
+                    executor.remove_node(entry)
+                except Exception:
+                    pass
+        for entry in nodes:
+            entry.destroy_node()
         if context.ok():
             context.shutdown()
 
@@ -654,12 +726,20 @@ def run_ros_runtime(
 def main(args: Sequence[str] | None = None) -> None:
     rclpy.init(args=args)
     node = RobotTrackNode()
+    nodes: list[Node] = [node]
+    if node.runtime_config.mode == "live":
+        nodes.append(RangerChassisGuardNode())
+    executor = SingleThreadedExecutor()
+    for entry in nodes:
+        executor.add_node(entry)
     try:
-        rclpy.spin(node)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        for entry in nodes:
+            executor.remove_node(entry)
+            entry.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 

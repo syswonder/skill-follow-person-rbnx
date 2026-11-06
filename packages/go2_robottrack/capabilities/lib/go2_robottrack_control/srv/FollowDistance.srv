@@ -1,5 +1,9 @@
-# operation: "set", "adjust", or "get".  For "adjust", meters is a signed
-# delta.  "get" ignores meters.
+# operation: "set", "adjust", "get", "lock", or "unlock".  For "adjust", meters
+# is a signed delta.  "get" ignores meters.  "lock" enrolls the person nearest
+# the camera as the one person to follow (specified-person lock); "unlock"
+# forgets them and restores ordinary following.  "lock"/"unlock" ignore meters
+# and are rejected with accepted=false when the deployment has the lock disabled
+# or its re-identification model unavailable.
 string operation
 float64 meters
 ---

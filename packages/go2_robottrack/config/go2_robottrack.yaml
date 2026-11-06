@@ -30,6 +30,27 @@ go2_robottrack:
     distance_max_forward_mps: 0.15
     distance_max_reverse_mps: 0.0
     distance_measurement_max_age_s: 0.60
+    distance_identity_max_age_s: 0.25
     distance_min_confidence: 0.50
     distance_pair_max_delta_s: 0.20
     distance_center_fallback: false
+    # Drop detections weaker than this before they can become candidates for
+    # enrolment or for identity matching.  0.0 keeps everything, which is what
+    # the HOG detector already does (its hitThreshold is 0.0, so every box it
+    # returns scores above 0.5).  The deployment raises it; see the manifest.
+    detector_min_confidence: 0.0
+    # Ranger chassis guard: restores the fail-closed command contract that
+    # go2_chassis provided internally and that the Ranger chassis primitive
+    # does not have, plus the 4WS turn-radius constraint.
+    guard_input_topic: /cmd_vel_guarded
+    guard_output_topic: /cmd_vel
+    guard_forward_only: true
+    guard_max_vx_mps: 0.25
+    guard_max_wz_rps: 0.40
+    guard_max_linear_accel_mps2: 0.30
+    guard_max_angular_accel_rps2: 0.80
+    guard_command_timeout_s: 0.25
+    guard_publish_hz: 50.0
+    guard_min_turn_radius_m: 0.81
+    guard_turn_policy: clamp_yaw
+    guard_spin_vx_epsilon_mps: 0.02

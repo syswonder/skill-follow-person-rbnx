@@ -36,4 +36,14 @@ source "${PACKAGE_SETUP}"
 set -u
 
 export PYTHONPATH="${ROBONIX_API_ROOT}:${ROOT}:${ROOT}/rbnx-build/codegen/proto_gen:${ROOT}/rbnx-build/codegen/robonix_mcp_types:${PYTHONPATH:-}"
+
+# The specified-person lock imports torch (through person_reid.py) inside this
+# process, and this image ships torch against a CUDA/cuDNN runtime that is not
+# on the default loader path.  The deployment supplies the directory list as
+# ROBONIX_TORCH_LIBRARY_PATH.  Unset means the ordinary follow profile: no
+# torch import is attempted unless the lock is enabled, so nothing changes.
+if [[ -n "${ROBONIX_TORCH_LIBRARY_PATH:-}" ]]; then
+  export LD_LIBRARY_PATH="${ROBONIX_TORCH_LIBRARY_PATH}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+fi
+
 exec python3 -m go2_robottrack.provider

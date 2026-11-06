@@ -1,18 +1,37 @@
-# Minimal robot model for the standalone Ranger follow deployment.  It declares
-# only what the follow stack needs — the chassis and the front camera — and
-# intentionally omits the mapping/nav2/speech/scene exports that belong to the
-# separate navigation deployment (robot-agilex-ranger_mini_v3).
+# Soma body description for the Ranger Mini v3 follow deployment.
+#
+# Soma v2 serves this YAML and the referenced URDF as raw text.  Keep it aligned
+# with the manifest: every provider that appears in robonix_manifest.yaml and
+# owns a physical part of the body must be declared here, or Atlas cannot
+# resolve it during discovery.
+#
+# Deliberately absent relative to robot-agilex-ranger_mini_v3/soma.yaml: the
+# Piper arm, the wrist camera, the arm perception pipeline, scene, explore,
+# pick, voiceprint and the memory service.  This deployment is follow-only.
+#
+# The RobotTrack follow primitive is NOT declared here -- matching the Go2
+# reference, where go2_robottrack also registers itself through Atlas rather
+# than through the body description.
+
+urdf:
+  path: ./urdf/ranger_mini.urdf
+  root_link: base_link
+  model_name: ranger_mini_v3
+
 robot:
   id: ranger_mini_v3_01
-  display_name: "AgileX Ranger Mini v3"
+  display_name: "AgileX Ranger Mini v3, MID-360, Orbbec Gemini 336L front camera"
   family: wheeled_robot
   root_part: base
-  # AgileX Ranger Mini v3 published dimensions (verify on the actual chassis
-  # before allowing follow motion).
+  # AgileX Ranger Mini v3 published dimensions.  Verify on the actual chassis
+  # before allowing follow motion.
   dimensions:
     length_m: 0.738
     width_m: 0.500
     height_m: 0.338
+  # Collision hull of the base in base_link.  Consumed through
+  # robonix/system/soma/footprint by the Nav2 costmaps, so it must stay in step
+  # with config/nav2_params.yaml's footprint placeholder.
   footprint:
     base_frame: base_link
     points:
@@ -23,9 +42,22 @@ robot:
   mass_kg: 63.0
 
   exports:
-    - provider_id: front_camera
+    - provider_id: robot_description
       capabilities:
-        - {path: robonix/primitive/camera/rgb, description: "Front Orbbec RGB image stream for follow perception."}
+        - { path: robonix/primitive/robot_description/driver, description: "Publish the Soma-owned URDF as /robot_description and TF." }
+    - provider_id: mapping
+      capabilities:
+        - { path: robonix/service/map/occupancy_grid, description: "Provide the live 2D occupancy grid." }
+        - { path: robonix/service/map/pointcloud, description: "Provide the fused 3D map point cloud." }
+        - { path: robonix/service/map/pose, description: "Provide the robot pose in the map frame." }
+        - { path: robonix/service/map/odom, description: "Provide map-aware odometry." }
+    - provider_id: nav2
+      capabilities:
+        - { path: robonix/service/navigation/navigate, description: "Provide the Nav2 velocity smoother and the velocity guard on the follow command chain." }
+    - provider_id: speech
+      capabilities:
+        - { path: robonix/service/speech/listen, description: "Listen through the configured speech backend." }
+        - { path: robonix/service/speech/speak, description: "Speak through the configured audio output." }
 
   components:
     - id: base
@@ -34,26 +66,62 @@ robot:
       exports:
         - provider_id: ranger_chassis
           capabilities:
-            - {path: robonix/primitive/chassis/driver, description: "AgileX Ranger Mini v3 chassis lifecycle driver."}
-            - {path: robonix/primitive/chassis/twist_in, description: "Canonical /cmd_vel velocity input (follow output goes here)."}
-            - {path: robonix/primitive/chassis/odom, description: "Ranger wheel/steer odometry and odom to base_link TF."}
+            - { path: robonix/primitive/chassis/driver, description: "AgileX Ranger Mini v3 chassis lifecycle driver." }
+            - { path: robonix/primitive/chassis/twist_in, description: "Canonical /cmd_vel velocity input; the chassis guard is its only writer." }
+            - { path: robonix/primitive/chassis/odom, description: "Ranger wheel/steer odometry and odom to base_link TF." }
       components:
-        - id: front_camera
-          type: rgb_camera
+        - id: lidar_top
+          type: lidar_3d
+          urdf_link: livox_frame
+          exports:
+            - provider_id: mid360_lidar
+              capabilities:
+                - { path: robonix/primitive/lidar/lidar3d, description: "Stream MID-360 3D point clouds for the Nav2 scan projection." }
+
+        - id: imu_top
+          type: imu
+          urdf_link: livox_frame
+          exports:
+            - provider_id: mid360_imu
+              capabilities:
+                - { path: robonix/primitive/imu/imu, description: "Stream the MID-360 IMU." }
+
+        - id: front_rgbd
+          type: rgbd_camera
           urdf_link: camera_435i_link
           exports:
             - provider_id: front_camera
               capabilities:
-                - {path: robonix/primitive/camera/rgb, description: "Front RGB image stream."}
+                - { path: robonix/primitive/camera/rgb, description: "Stream the front Orbbec RGB image the model consumes." }
+                - { path: robonix/primitive/camera/depth, description: "Stream the front Orbbec aligned depth the distance estimator consumes." }
+                - { path: robonix/primitive/camera/intrinsics, description: "Publish Orbbec color camera intrinsics." }
+                - { path: robonix/primitive/camera/extrinsics, description: "Publish Orbbec mount extrinsics when available." }
+                - { path: robonix/primitive/camera/camera_info, description: "Publish the Orbbec color camera_info used by the depth pairing." }
+
+        - id: client_audio
+          type: audio_io
+          exports:
+            - provider_id: audio_client_bridge
+              capabilities:
+                - { path: robonix/primitive/audio/mic, description: "Receive client-side microphone audio over the reverse bridge." }
+                - { path: robonix/primitive/audio/speaker, description: "Send speech audio to the client bridge." }
 
 description:
-  summary: "AgileX Ranger Mini v3 configured solely for MiniCPM-RobotTrack person following."
+  summary: >-
+    AgileX Ranger Mini v3 configured solely for MiniCPM-RobotTrack person
+    following.  The front Orbbec Gemini 336L provides the RGB the model consumes
+    and the aligned depth the fixed-distance controller consumes.  The command
+    chain is source mux, Nav2 velocity smoother, Nav2 velocity guard, the Ranger
+    chassis guard, then the chassis itself.
   can_do:
     - "Stream front RGB-D imagery to the MiniCPM-RobotTrack inference server."
-    - "Follow a person under supervision by publishing guarded velocity to /cmd_vel."
+    - "Follow a person under supervision while holding a target distance."
+    - "Accept Chinese follow-distance commands through Pilot ('靠近一点', '保持 5 米')."
   cannot_do:
-    - "Map, localize or navigate — that is the separate navigation deployment's job."
+    - "Change where the robot is going on its own: the follow loop uses the Nav2 velocity smoother and guard, never the Nav2 planner."
     - "Run at the same time as the navigation stack (both own the can_ranger bus)."
+    - "Drive in reverse: the whole chain is forward-only, matching the Go2 reference."
   notes:
-    - "Dimensions and follow speed limits must be verified on the target chassis before live motion."
     - "Defaults to dry-run: no velocity is published until a human sets mode: live."
+    - "The Ranger chassis discards linear.x and pivots in place below its turn radius; the chassis guard prevents that silently happening."
+    - "guard_min_turn_radius_m comes from the vendor manual, not from measurement; calibrate it on the robot before tuning follow behaviour."

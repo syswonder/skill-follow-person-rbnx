@@ -103,9 +103,11 @@ The standalone ROS defaults are in `config/go2_robottrack.yaml`:
 | `distance_deadband_m` / `distance_kp` | `0.25` / `0.25` |
 | `distance_max_forward_mps` / `distance_max_reverse_mps` | `0.15` / `0.0` |
 | `distance_measurement_max_age_s` | `0.60` |
+| `distance_identity_max_age_s` | `0.25` |
 | `distance_min_confidence` | `0.50` |
 | `distance_pair_max_delta_s` | `0.20` |
 | `distance_center_fallback` | `false` |
+| `detector_min_confidence` | `0.0` |
 
 These are the package's conservative standalone/dry-run defaults. The
 dedicated workstation fixed-distance renderer explicitly uses the already

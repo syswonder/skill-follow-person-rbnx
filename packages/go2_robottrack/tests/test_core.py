@@ -41,6 +41,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertFalse(config.distance_enabled)
         self.assertEqual(config.target_distance_m, 5.0)
         self.assertEqual(config.distance_max_forward_mps, 0.15)
+        self.assertEqual(config.distance_identity_max_age_s, 0.25)
 
         round_trip = RuntimeConfig.from_mapping(
             RuntimeConfig().as_ros_parameters()
@@ -76,6 +77,20 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(yaw.max_wz, 0.40)
         with self.assertRaisesRegex(ValueError, "max_wz"):
             RuntimeConfig.from_mapping({"max_wz": 0.41})
+
+    def test_identity_measurement_window_is_bounded(self) -> None:
+        # The window a measurement may live with the lock deployed: long enough
+        # for one inference pass plus jitter, short enough that a dead camera
+        # stops the robot instead of letting it coast on the last thing it saw.
+        config = RuntimeConfig.from_mapping({"distance_identity_max_age_s": 0.30})
+        self.assertEqual(config.distance_identity_max_age_s, 0.30)
+        for override in (
+            {"distance_identity_max_age_s": 0.0},
+            {"distance_identity_max_age_s": 2.1},
+            {"distance_identity_max_age_s": "soon"},
+        ):
+            with self.subTest(override=override), self.assertRaises(ValueError):
+                RuntimeConfig.from_mapping(override)
 
     def test_official_model_input_geometry_is_fixed(self) -> None:
         with self.assertRaisesRegex(ValueError, "model_input_mode"):

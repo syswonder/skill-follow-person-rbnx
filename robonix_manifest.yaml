@@ -5,59 +5,111 @@ catalog:
   name: robonix.robot.agilex.ranger_mini_v3.follow
   version: 0.1.0
   description: >-
-    Standalone MiniCPM-RobotTrack person-following deployment for the AgileX
-    Ranger Mini v3.  Physically isolated from the navigation/SLAM deployment
-    (robot-agilex-ranger_mini_v3): a separate manifest, its own chassis + camera
-    primitives, and a dedicated follow primitive.  Only ever runs when the
-    navigation stack is stopped (single-service rule) so the two never contend
-    for the can_ranger bus or for /cmd_vel.
+    Robonix x MiniCPM-RobotTrack person-following deployment for the AgileX
+    Ranger Mini v3, reproducing the Go2 reference
+    (robot-unitree-go2 PR #6) with the chassis swapped: ranger_chassis +
+    chassis guard replace go2_chassis + its SDK daemon.  Everything else --
+    the source mux, the Nav2 velocity smoother, the velocity guard, the
+    Pilot/Executor capability path and the Chinese follow-distance router --
+    is carried over.  Runs only while the navigation deployment
+    (robot-agilex-ranger_mini_v3) is stopped: both own can_ranger.
   license: Apache-2.0
-  tags: [robot, deploy, agilex, ranger_mini_v3, wheeled, camera, minicpm, robottrack, following, ros2]
+  tags: [robot, deploy, agilex, ranger_mini_v3, minicpm, robottrack, following, ros2]
   maintainers:
-    - wangxiaofeng
+    - wangxiaofeng <wxf0705186@users.noreply.github.com>
 
+# ---------------------------------------------------------------------------
+# The reference profile deliberately does NOT start Scene (it was the source of
+# an OOM on the reference host) and DOES keep Mapping, Nav2, the smoother/guard
+# chain, the chassis, the camera and speech.  That is reproduced here.
+# ---------------------------------------------------------------------------
 env:
-  # Ranger navigation stack uses zenoh; keep the follow stack on the same RMW so
-  # the chassis primitive (built against the Ranger target) behaves identically.
+  ROS_DOMAIN_ID: "0"
+  # The Ranger chassis primitive, the Nav2 service and the rest of this stack
+  # are all built for the navigation deployment's zenoh transport.  Keep the
+  # same RMW so topics interoperate exactly as they do under navigation.
   RMW_IMPLEMENTATION: rmw_zenoh_cpp
-  ROBONIX_PROVIDER_BIND_HOST: 127.0.0.1
-  ROBONIX_ADVERTISE_HOST: 127.0.0.1
-  # Keep every model/runtime cache inside this ignored deployment checkout so
-  # the follow stack never falls back to a global home-directory cache.
-  XDG_CACHE_HOME: ${ROBONIX_DEPLOY_DIR}/.cache/xdg
-  MODELSCOPE_CACHE: ${ROBONIX_DEPLOY_DIR}/.cache/modelscope
-  HF_HOME: ${ROBONIX_DEPLOY_DIR}/.cache/huggingface
-  TORCH_HOME: ${ROBONIX_DEPLOY_DIR}/.cache/torch
+  # Provider sockets bind 0.0.0.0 and auto-advertise the LAN IP, exactly like
+  # the navigation deployment: the robonix-client dials speaker/mic provider
+  # endpoints (e.g. audio_client_bridge's ephemeral gRPC port) directly from
+  # the remote PC, so a loopback bind makes every remote dial fail with
+  # "connection refused" while all local self-checks still pass.
+
+  MAPPING_MAPS_DIR: ${HOME}/.robonix/maps
+  MAPPING_WEBUI_HOST: 0.0.0.0
+
+  # Build-time mirrors only.  All model weights are prepared by build scripts;
+  # start must not download models.
+  HF_ENDPOINT: https://hf-mirror.com
+  PIP_INDEX_URL: https://pypi.tuna.tsinghua.edu.cn/simple
+
+  # Cloud speech needs no local ASR/TTS models or GPU runtime.  SecretId and
+  # SecretKey are supplied only through the operator environment.
+  SPEECH_BACKEND: tencent
+
+  # The Nav2 velocity guard's sole output.  It is NOT /cmd_vel: the Ranger
+  # chassis guard sits after it, applies the Ranger-specific 4WS turn-radius
+  # constraint and the restored Go2 clamps, and is the only writer of /cmd_vel.
+  ROBONIX_VELOCITY_OUTPUT_TOPIC: /cmd_vel_guarded
+
+  # The specified-person lock runs OSNet (torch) inside the go2_robottrack
+  # process, and this image's torch needs its cuDNN/CUDA runtime directories on
+  # the loader path.  Same value the RobotTrack inference server exports; keep
+  # the two in step if the image's CUDA version changes.
+  ROBONIX_TORCH_LIBRARY_PATH: /usr/local/lib/python3.10/dist-packages/nvidia/cudnn/lib:/usr/local/cuda-12.6/targets/aarch64-linux/lib
 
 system:
-  atlas: {listen: 127.0.0.1:50051, log: info}
-  executor: {listen: 127.0.0.1:50061, log: info}
-  liaison: {listen: 127.0.0.1:50081, log: info}
+  atlas:
+    listen: 0.0.0.0:50051
+  executor:
+    listen: 0.0.0.0:50061
+  # Pilot is the Robonix dialogue core and it is required, not optional: the
+  # follow-distance capability is reachable only through it.  Its ``vlm`` is
+  # not a network model -- the deployment points VLM_BASE_URL at the local
+  # semantic intent router (packages/semantic_intent_router), which turns one
+  # bounded Chinese utterance into one follow_distance capability call.
+  pilot:
+    listen: 127.0.0.1:50071
+    vlm:
+      upstream: ${VLM_BASE_URL}
+      api_key: ${VLM_API_KEY}
+      model: ${VLM_MODEL}
+      api_format: openai
   soma:
     listen: 127.0.0.1:50091
-    provider_id: soma
     robot_yaml: ${ROBONIX_DEPLOY_DIR}/soma.yaml
-    log: info
+  vitals:
+    listen: 0.0.0.0:50093
+  liaison:
+    listen: 0.0.0.0:50081
 
 primitive:
-  # ------------------------------------------------------------------ chassis
-  # Identical upstream primitive to the one the navigation deployment uses, so
-  # the CAN wiring, odom and /cmd_vel contract match exactly.  This stack starts
-  # the chassis ITSELF; therefore it must never run while the navigation stack
-  # is up (both would launch ranger_bringup and fight for can_ranger).
-  - name: ranger_chassis
-    url: https://github.com/syswonder/primitive-agilex-ranger_mini_v3-chassis-rbnx
+  # Publishes the Soma-owned URDF as /robot_description and the standard TF
+  # tree.  Nav2's costmaps and the velocity smoother both need this frame tree.
+  - name: robot_description
+    url: https://github.com/syswonder/primitive-robot-description-rbnx
+    branch: main
+    manifest: package_manifest.native.yaml
+
+  # Nav2's LaserScan projection is fed by the Mid360 cloud; the IMU is declared
+  # by the navigation profile and kept here so nav2's provider set is complete.
+  - name: mid360_lidar
+    url: https://github.com/syswonder/primitive-livox-mid360-lidar-rbnx
     branch: main
     config:
-      port_name: can_ranger
-      publish_odom_tf: true
-      # Chassis subscribes here; robottrack publishes here (see below).
-      cmd_vel_topic: /cmd_vel
+      lidar_ip: ${LIDAR_IP}
+      host_ip: ${LIDAR_HOST_IP}
+      xfer_format: 0
+      sentinel_timeout_s: 20.0
 
-  # ------------------------------------------------------------------- camera
-  # Orbbec Gemini 336L, same model/params as the navigation deployment's
-  # front_camera so topic names and the RGB-D stream are identical.  camera_name
-  # camera_435i => /camera_435i/color/... and /camera_435i/depth/... topics.
+  - name: mid360_imu
+    url: https://github.com/syswonder/primitive-livox-mid360-imu-rbnx
+    branch: main
+    config:
+      sentinel_timeout_s: 45.0
+
+  # Orbbec Gemini 336L -- the Ranger's equivalent of the reference D435i.  RGB
+  # feeds the model; RGB + aligned depth feed the fixed-distance estimator.
   - name: front_camera
     url: https://github.com/syswonder/primitive-orbbec-camera
     branch: main
@@ -73,19 +125,44 @@ primitive:
       enable_imu: false
       sentinel_timeout_s: 45.0
 
+  # CHASSIS SUBSTITUTION (the one intentional deviation from Go2).  Go2 paired
+  # go2_chassis with an SDK daemon that enforced a fail-closed motion gate, a
+  # 0.25 m/s clamp, a 0.25 s command timeout and a zero preamble.  The Ranger
+  # primitive accepts up to 1.5 m/s and has none of those, so the equivalent
+  # protection is restored by the chassis guard configured in go2_robottrack
+  # below.  Both stacks start ranger_bringup, hence the single-service rule.
+  - name: ranger_chassis
+    url: https://github.com/syswonder/primitive-agilex-ranger_mini_v3-chassis-rbnx
+    branch: main
+    config:
+      port_name: can_ranger
+      publish_odom_tf: true
+      # The chassis guard is the only writer of /cmd_vel.
+      cmd_vel_topic: /cmd_vel
+
+  # Audio: client-side mic + speaker via the reverse WebSocket bridge.  Speech
+  # is only usable when a robonix-client is connected to this port.
+  - name: audio_client_bridge
+    url: https://github.com/syswonder/primitive-audio-client-bridge-rbnx
+    branch: main
+    config:
+      transport: reverse
+      listen_host: 0.0.0.0
+      listen_port: 60002
+
   # ---------------------------------------------------------------- robottrack
   # The MiniCPM-RobotTrack follow bridge.  The package itself is model-agnostic
-  # (depends: []; no Unitree SDK); every Ranger-specific value is overridden
-  # here in config rather than by editing the package's default yaml.
+  # (depends: []; no Unitree SDK) and is shared unchanged with the reference.
   #
-  # KEY WIRING DIFFERENCE FROM GO2:  on Go2 the follow output went to
-  # /cmd_vel_nav (Go2 had a downstream velocity guard/smoother).  This stack has
-  # no Nav2, so robottrack publishes straight to /cmd_vel, which the Ranger
-  # chassis subscribes to.
+  # WIRING (identical in shape to Go2): robottrack publishes its raw command,
+  # the internal source mux is the sole publisher on selected_output_topic
+  # (/cmd_vel_nav), Nav2's velocity smoother consumes that, the Nav2 velocity
+  # guard writes ROBONIX_VELOCITY_OUTPUT_TOPIC, the Ranger chassis guard
+  # applies the Ranger constraints, and ranger_chassis drives the wheels.
   #
-  # SAFETY:  mode defaults to dry-run — the node predicts and logs but PUBLISHES
-  # NOTHING to /cmd_vel until a human flips mode: live.  Bring the stack up in
-  # dry-run first, confirm camera + inference + prediction logs, then go live.
+  # SAFETY: mode defaults to dry-run -- the node predicts and logs but PUBLISHES
+  # NOTHING until a human flips mode to live.  In dry-run the chassis guard is
+  # not started either, so no process publishes a non-zero velocity.
   - name: go2_robottrack
     path: ${ROBONIX_DEPLOY_DIR}/packages/go2_robottrack
     config:
@@ -104,27 +181,215 @@ primitive:
       control_dt: 0.1
       dispatch_hz: 50.0
       max_plan_age_s: 1.5
-      # Ranger is faster and holonomic-ish (4WS) vs the Go2 forward-only gait,
-      # but keep the first bring-up conservative — raise only after live tuning.
-      max_vx: 0.15
+      # The reference live profile: 0.50 m/s forward, 0.30 rad/s yaw.  The
+      # package's conservative defaults (0.15 / 0.30) are the dry-run values and
+      # are deliberately overridden here, exactly as the Go2 renderer does.
+      max_vx: 0.50
       max_wz: 0.30
-      # No Nav2 in this stack: publish directly to the chassis input.  The
-      # internal mux still selects between nav_raw and robottrack_raw; with no
-      # nav publisher present it simply forwards robottrack.
       nav_raw_topic: /ranger/robottrack/nav_cmd_vel_raw
       robottrack_raw_topic: /ranger/robottrack/cmd_vel_raw
-      selected_output_topic: /cmd_vel
+      selected_output_topic: /cmd_vel_nav
       selected_source: robottrack
       source_max_age_s: 0.25
-      distance_enabled: false
-      target_distance_m: 5.0
+      # Fixed-distance follow is part of the reference capability set (default
+      # 5.0 m, adjustable 0.5..7.0 m at runtime, including by voice).
+      distance_enabled: true
+      target_distance_m: 1.0
       min_target_distance_m: 0.5
       max_target_distance_m: 7.0
-      distance_deadband_m: 0.25
-      distance_kp: 0.25
-      distance_max_forward_mps: 0.15
+      # Reference live values, not the conservative package defaults
+      # (0.25 / 0.25) which the reference measured as effectively unresponsive.
+      distance_deadband_m: 0.10
+      distance_kp: 0.50
+      distance_max_forward_mps: 0.50
       distance_max_reverse_mps: 0.0
       distance_measurement_max_age_s: 0.60
+      # With the lock deployed a measurement only exists because a frame showed
+      # the enrolled person, so its lifetime is capped at the frame that
+      # produced it rather than at the ordinary jitter tolerance.
+      #
+      # The cap has to cover the whole estimator, and the estimator is aged from
+      # the FRAME'S arrival, not from the moment the result lands.  Measured on
+      # this Orin: one RGB-D estimate is HOG 185 ms THEN OSNet 60 ms -- median
+      # 210 ms end to end, worst 419 ms -- so a result is already ~0.21 s old
+      # when it is committed.  At 0.25 s the dispatcher's expire-before-use
+      # order (see RobotTrackNode._dispatch) cleared it before any command could
+      # use it: measured vx = 0 in 371/371 commands with wz passing straight
+      # through, i.e. the robot turned but never translated.  The earlier 0.25
+      # assumed OSNet's ~60 ms was the entire cost; HOG runs first and costs 3x
+      # that.
+      #
+      # 0.60 is the pre-lock value and the same bound the commit-time freshness
+      # check (distance_measurement_max_age_s) already applies, so a camera that
+      # stops delivering still stops the robot inside the existing contract.
+      distance_identity_max_age_s: 0.60
       distance_min_confidence: 0.50
       distance_pair_max_delta_s: 0.20
       distance_center_fallback: false
+      # ---------------------------------------------- detector quality floor
+      # The HOG detector returns every weakly-positive window (its hitThreshold
+      # is 0.0) and reports confidence as sigmoid(SVM margin), so EVERY box it
+      # returns already scores above 0.5 -- the ones this cuts are the barely-
+      # positive ones, which on background clutter are furniture and wall edges.
+      # They matter because the identity gate below scores every box with OSNet
+      # and one frame over the threshold is enough to produce a target: a single
+      # junk box that resembles the template sends the robot off after nobody.
+      # 0.0 = keep everything (the pre-existing behaviour).
+      #
+      # Tuning ladder if the robot still wanders: 0.60 -> 0.70 -> 0.80.  If it
+      # stops finding the enrolled person, come back DOWN -- a floor above the
+      # confidence of a genuine detection makes the robot stop, which looks
+      # exactly like the failure this is meant to cure.  Measure before moving
+      # far: scripts/probe_person_detection.py prints the real distribution.
+      detector_min_confidence: 0.60
+      # ------------------------------------------- specified-person lock (ReID)
+      # "跟着我" enrols the person the camera first sees as the only person to
+      # follow; "别跟了" forgets them.  The gate runs inside the RGB-D estimator
+      # before any association, so a stranger can never be selected -- not even
+      # one scoring higher on the detector or sitting closer to the previous
+      # box.
+      #
+      # While reid_enabled is true the rule for forward motion is one line:
+      # vx is non-zero only while a verified match of the enrolled person is in
+      # frame.  Everything else -- nobody has asked yet, waiting for the person
+      # to appear, enrolment failed, the person walked out, OSNet failed to load
+      # -- holds vx=0.  Turning is untouched: an in-place rotation is allowed.
+      # To get the pre-existing "follow whoever is in frame" loop back, set
+      # reid_enabled: false (that loop is unchanged and still tested).
+      #
+      # OSNet loads once at start and the per-frame forward pass only runs while
+      # a lock is engaged or being enrolled.  A model that fails to load is
+      # logged loudly -- the node keeps running, but with no identity available
+      # nothing can be verified and the robot will not translate.
+      reid_enabled: true
+      reid_model_dir: ${ROBONIX_DEPLOY_DIR}/models/osnet
+      # Same-camera, same-session matching, so the margin is wide: measured on
+      # this rig, a true match of the enrolled person scores 0.96-0.99.  The
+      # gate is PER-FRAME with no temporal confirmation (see Step 18), so this
+      # number is the only thing between a background crop and a non-zero vx.
+      # 0.70 left a 0.26 band under a true match for junk to climb into; 0.80
+      # still clears the measured true-match floor by ~0.16.
+      #
+      # If the enrolled person starts getting dropped -- turning away, walking
+      # into shadow, partially out of frame -- come back down before blaming
+      # anything else; a dropped lock stops the robot.
+      reid_match_threshold: 0.80
+      # Enrolment averages a few consecutive frames of the target to blunt one
+      # bad crop.  At ~30 fps this completes in well under a second.
+      reid_enroll_samples: 5
+      reid_device: cuda:0
+      # ------------------------------------------------ Ranger chassis guard
+      # CHASSIS SUBSTITUTION.  Each key restores a protection that lived inside
+      # go2_chassis (or its SDK daemon) and that the Ranger primitive lacks,
+      # plus one constraint the Ranger needs and Go2 never did.
+      #
+      # The Ranger's RangerROSMessenger::TwistCmdCallback computes
+      # radius = |linear.x| / |angular.z| and, below its min_turn_radius,
+      # switches to SPINNING and calls SetMotionCommand(0.0, 0.0, angular.z) --
+      # linear.x is DISCARDED, so a tight follow curve becomes a pivot in place
+      # and the robot stops closing the distance.  clamp_yaw holds the pair at
+      # the turn radius instead, preserving translation the way the Go2 sport
+      # service did.  allow_spin lets the chassis pivot deliberately; block
+      # refuses the command outright.
+      #
+      # Input is the Nav2 velocity guard's output, not /cmd_vel_nav: the guard
+      # is the last stage before the chassis.
+      guard_input_topic: /cmd_vel_guarded
+      guard_output_topic: /cmd_vel
+      # go2_chassis rejected negative linear.x; the Ranger Ackermann path would
+      # drive in reverse.  The whole reference chain is forward-only.
+      guard_forward_only: true
+      # go2_chassis clamped at 0.25 m/s / 0.40 rad/s.  The smoother already
+      # limits to 0.50 / 0.30; these are the chassis-side ceiling.
+      guard_max_vx_mps: 0.25
+      guard_max_wz_rps: 0.40
+      guard_max_linear_accel_mps2: 0.30
+      guard_max_angular_accel_rps2: 0.80
+      # go2_chassis stopped after 0.25 s without a command.  The Ranger's own
+      # sentinel is 30 s, and the AgileX firmware watchdog is 500 ms.
+      guard_command_timeout_s: 0.25
+      guard_publish_hz: 50.0
+      # The vendored ranger_ros2 inside the chassis primitive reuses
+      # RangerMiniV2Params for robot_model=ranger_mini_v3 (0.4764 m, the V2
+      # steering limit); the published Mini 3.0 manual states 0.81 m.  The
+      # larger, stricter value guarantees the command never reaches the
+      # chassis's radius branch.  Re-calibrate on the robot before tuning.
+      guard_min_turn_radius_m: 0.81
+      guard_turn_policy: clamp_yaw
+      guard_spin_vx_epsilon_mps: 0.02
+
+service:
+  - name: speech
+    path: ${ROBONIX_SOURCE_PATH}/services/speech
+    config:
+      speech_backend: tencent
+      tencent_asr_appid: ${TENCENT_ASR_APPID}
+      tencent_asr_engine: 16k_zh
+      tencent_tts_voice_type: 1001
+      tencent_tts_region: ap-guangzhou
+      default_speaker_provider_id: audio_client_bridge
+
+  - name: mapping
+    url: https://github.com/syswonder/service-map-rbnx
+    branch: main
+    manifest: package_manifest.jetson-native.yaml
+    config:
+      webui_port: 8091
+      deskew_lidar: true
+      occupancy_sources: [lidar]
+      params_file: config/rtabmap_params.yaml
+      sensor_providers:
+        lidar3d: mid360_lidar
+        odom: ranger_chassis
+        rgb: front_camera
+        depth: front_camera
+        imu: mid360_imu
+
+  # Nav2 in the follow profile.  RobotTrack never asks Nav2 to plan: the follow
+  # loop only reuses the velocity smoother and the existing velocity guard, as
+  # the reference states explicitly.  The rest of the Nav2 node set stays
+  # configured because navigation_launch.py starts it and the provider set below
+  # is what the service requires to come up.
+  #
+  # VENDORED, NOT `url:`-FETCHED.  The follow wiring needs
+  # `controller_velocity_output_topic` -- the opt-in that moves Nav2's raw
+  # controller/behaviour producers off /cmd_vel_nav so the source mux is its
+  # sole publisher.  That commit (d10fe3d, "feat(navigation): expose optional
+  # raw velocity output") is NOT on upstream main, so `branch: main` cannot
+  # provide it; the reference gitlink-pins it for the same reason.  Vendoring
+  # also keeps this deployment from silently changing under a network fetch.
+  # See third_party/README.md for the pinned revision.
+  - name: nav2
+    path: ${ROBONIX_DEPLOY_DIR}/third_party/service-navigation-rbnx
+    manifest: package_manifest.jetson-native.yaml
+    config:
+      params_file: config/nav2_params.yaml
+      bt_xml_file: config/navigate.xml
+      # THE pre-smoother opt-in: Nav2's controller_server publishes here instead
+      # of /cmd_vel_nav, which is where the mux reads the navigation candidate.
+      # Without this the controller and the mux would both write /cmd_vel_nav.
+      controller_velocity_output_topic: /ranger/robottrack/nav_cmd_vel_raw
+      velocity_output_topic: ${ROBONIX_VELOCITY_OUTPUT_TOPIC}
+      scan_projection:
+        enabled: true
+        min_height_m: 0.30
+        max_height_m: 1.40
+        range_max_m: 12.0
+        self_filter_margin_m: 0.05
+      action_wait_s: 90.0
+      dynamic_speed:
+        max_linear_speed_mps: 0.5
+        default_percentage: 100
+      # Follow's terminal guard values, carried from the reference profile.  The
+      # guard's latches are navigation-goal conditions, so they stay inert in a
+      # follow-only run; the limits below also bound the smoother's output.
+      guard_terminal_xy_m: 0.20
+      guard_terminal_timeout_s: 12.0
+      guard_no_progress_s: 6.0
+      guard_global_spin_timeout_s: 18.0
+      guard_global_spin_limit_rad: 4.20
+      provider_ids:
+        map: mapping
+        odom: ranger_chassis
+        scan_cloud: mid360_lidar
+        imu: mid360_imu

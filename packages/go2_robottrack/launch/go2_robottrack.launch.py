@@ -22,5 +22,17 @@ def generate_launch_description() -> LaunchDescription:
                     {"mode": LaunchConfiguration("mode")},
                 ],
             ),
+            # Ranger chassis adaptation.  The provider runtime starts this from
+            # run_ros_runtime; listing it here keeps `ros2 launch` equivalent.
+            Node(
+                package="go2_robottrack",
+                executable="robottrack_chassis_guard",
+                name="ranger_chassis_guard",
+                output="screen",
+                parameters=[
+                    LaunchConfiguration("config"),
+                    {"mode": LaunchConfiguration("mode")},
+                ],
+            ),
         ]
     )
