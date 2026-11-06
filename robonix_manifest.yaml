@@ -166,7 +166,7 @@ primitive:
   - name: go2_robottrack
     path: ${ROBONIX_DEPLOY_DIR}/packages/go2_robottrack
     config:
-      mode: live
+      mode: dry-run
       rgb_topic: /camera_435i/color/image_raw
       depth_topic: /camera_435i/depth/image_raw
       camera_info_topic: /camera_435i/color/camera_info
